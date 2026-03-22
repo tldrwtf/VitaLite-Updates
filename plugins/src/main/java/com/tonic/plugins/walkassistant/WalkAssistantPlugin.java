@@ -18,6 +18,8 @@ import javax.inject.Inject;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Collection;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicReference;
@@ -232,42 +234,59 @@ public class WalkAssistantPlugin extends Plugin
             }
             log("[WalkAssistant] selectedQuest type: " + selectedQuest.getClass().getName());
 
+            boolean hasCurrentStep = false;
             Method getCurrentStep = findMethod(selectedQuest.getClass(), "getCurrentStep");
-            if (getCurrentStep == null)
+            if (getCurrentStep != null)
             {
-                logWarn("[WalkAssistant] 'getCurrentStep' method not found on " + selectedQuest.getClass().getName());
-                return null;
-            }
-            getCurrentStep.setAccessible(true);
-            Object currentStep = getCurrentStep.invoke(selectedQuest);
-            if (currentStep == null)
-            {
-                logWarn("[WalkAssistant] getCurrentStep() returned null - no active step.");
-                return null;
-            }
-            log("[WalkAssistant] currentStep type: " + currentStep.getClass().getName());
-
-            Object activeStep = currentStep;
-            Method getActiveStep = findMethod(currentStep.getClass(), "getActiveStep");
-            if (getActiveStep != null)
-            {
-                getActiveStep.setAccessible(true);
-                Object unwrapped = getActiveStep.invoke(currentStep);
-                if (unwrapped != null)
+                getCurrentStep.setAccessible(true);
+                Object currentStep = getCurrentStep.invoke(selectedQuest);
+                if (currentStep != null)
                 {
-                    activeStep = unwrapped;
-                    log("[WalkAssistant] Unwrapped to active step: " + activeStep.getClass().getName());
+                    hasCurrentStep = true;
+                    log("[WalkAssistant] currentStep type: " + currentStep.getClass().getName());
+
+                    Object activeStep = currentStep;
+                    Method getActiveStep = findMethod(currentStep.getClass(), "getActiveStep");
+                    if (getActiveStep != null)
+                    {
+                        getActiveStep.setAccessible(true);
+                        Object unwrapped = getActiveStep.invoke(currentStep);
+                        if (unwrapped != null)
+                        {
+                            activeStep = unwrapped;
+                            log("[WalkAssistant] Unwrapped to active step: " + activeStep.getClass().getName());
+                        }
+                    }
+
+                    WorldPoint destination = resolveWorldPointFromStep(activeStep);
+                    if (destination != null)
+                    {
+                        log("[WalkAssistant] Resolved destination from active step: " + destination);
+                        return destination;
+                    }
+                    logWarn("[WalkAssistant] No location on active step: " + activeStep.getClass().getName());
+                }
+                else
+                {
+                    log("[WalkAssistant] getCurrentStep() returned null (quest likely NOT_STARTED).");
                 }
             }
 
-            WorldPoint destination = resolveMapPoint(activeStep);
-            if (destination != null)
+            // Fallback: only use PanelDetails when there is no current step (quest NOT_STARTED).
+            // If a step exists but has no location (e.g. dialogue step mid-quest), we should not
+            // fall back to the quest start location as that would be misleading.
+            if (!hasCurrentStep)
             {
-                log("[WalkAssistant] Resolved destination from mapPoint: " + destination);
-                return destination;
+                log("[WalkAssistant] Attempting PanelDetails fallback for start location...");
+                WorldPoint fallback = tryQuestHelperPanelFallback(selectedQuest);
+                if (fallback != null)
+                {
+                    log("[WalkAssistant] Resolved destination from PanelDetails fallback: " + fallback);
+                    return fallback;
+                }
             }
 
-            logWarn("[WalkAssistant] No mapPoint on step: " + activeStep.getClass().getName());
+            logWarn("[WalkAssistant] All Quest Helper resolution strategies exhausted.");
         }
         catch (Exception e)
         {
@@ -305,6 +324,202 @@ public class WalkAssistantPlugin extends Plugin
         catch (Exception e)
         {
             logWarn("[WalkAssistant] mapPoint resolution failed: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private WorldPoint resolveWorldPointFromStep(Object step)
+    {
+        return resolveWorldPointFromStep(step, 0);
+    }
+
+    private WorldPoint resolveWorldPointFromStep(Object step, int depth)
+    {
+        if (step == null || depth > 3)
+        {
+            return null;
+        }
+
+        WorldPoint fromMapPoint = resolveMapPoint(step);
+        if (fromMapPoint != null)
+        {
+            return fromMapPoint;
+        }
+
+        try
+        {
+            Field worldPointField = findField(step.getClass(), "worldPoint");
+            if (worldPointField != null)
+            {
+                worldPointField.setAccessible(true);
+                Object wpObj = worldPointField.get(step);
+                if (wpObj instanceof WorldPoint)
+                {
+                    log("[WalkAssistant] Resolved via worldPoint field: " + wpObj);
+                    return (WorldPoint) wpObj;
+                }
+                if (wpObj instanceof List)
+                {
+                    List<?> wpList = (List<?>) wpObj;
+                    for (Object item : wpList)
+                    {
+                        if (item instanceof WorldPoint)
+                        {
+                            log("[WalkAssistant] Resolved via worldPoint list: " + item);
+                            return (WorldPoint) item;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logWarn("[WalkAssistant] worldPoint field resolution failed: " + e.getMessage());
+        }
+
+        try
+        {
+            Field wmPointField = findField(step.getClass(), "worldMapPoint");
+            if (wmPointField != null)
+            {
+                wmPointField.setAccessible(true);
+                Object wmObj = wmPointField.get(step);
+                if (wmObj != null)
+                {
+                    Method getWp = findMethod(wmObj.getClass(), "getWorldPoint");
+                    if (getWp != null)
+                    {
+                        getWp.setAccessible(true);
+                        Object wp = getWp.invoke(wmObj);
+                        if (wp instanceof WorldPoint)
+                        {
+                            log("[WalkAssistant] Resolved via worldMapPoint field: " + wp);
+                            return (WorldPoint) wp;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logWarn("[WalkAssistant] worldMapPoint resolution failed: " + e.getMessage());
+        }
+
+        try
+        {
+            Field stepsField = findField(step.getClass(), "steps");
+            if (stepsField != null)
+            {
+                stepsField.setAccessible(true);
+                Object stepsObj = stepsField.get(step);
+                Collection<?> childSteps = null;
+
+                if (stepsObj instanceof Map)
+                {
+                    childSteps = ((Map<?, ?>) stepsObj).values();
+                    log("[WalkAssistant] ConditionalStep has " + childSteps.size() + " child steps (Map).");
+                }
+                else if (stepsObj instanceof Collection)
+                {
+                    childSteps = (Collection<?>) stepsObj;
+                    log("[WalkAssistant] Step has " + childSteps.size() + " child steps (Collection).");
+                }
+
+                if (childSteps != null)
+                {
+                    for (Object child : childSteps)
+                    {
+                        WorldPoint childWp = resolveWorldPointFromStep(child, depth + 1);
+                        if (childWp != null)
+                        {
+                            return childWp;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logWarn("[WalkAssistant] Child step resolution failed: " + e.getMessage());
+        }
+
+        return null;
+    }
+
+    private WorldPoint tryQuestHelperPanelFallback(Object selectedQuest)
+    {
+        try
+        {
+            Method getSteps = findMethod(selectedQuest.getClass(), "getSteps");
+            if (getSteps == null)
+            {
+                logWarn("[WalkAssistant] 'getSteps' method not found on " + selectedQuest.getClass().getName());
+                return null;
+            }
+            getSteps.setAccessible(true);
+            Object panelListObj = getSteps.invoke(selectedQuest);
+            if (!(panelListObj instanceof List))
+            {
+                logWarn("[WalkAssistant] getSteps() did not return a List, got: "
+                    + (panelListObj == null ? "null" : panelListObj.getClass().getName()));
+                return null;
+            }
+
+            List<?> panelList = (List<?>) panelListObj;
+            if (panelList.isEmpty())
+            {
+                logWarn("[WalkAssistant] PanelDetails list is empty.");
+                return null;
+            }
+
+            for (int pi = 0; pi < panelList.size(); pi++)
+            {
+                Object panel = panelList.get(pi);
+                if (panel == null)
+                {
+                    continue;
+                }
+                log("[WalkAssistant] Checking PanelDetails[" + pi + "] type: " + panel.getClass().getName());
+
+                Method getPanelSteps = findMethod(panel.getClass(), "getSteps");
+                if (getPanelSteps == null)
+                {
+                    logWarn("[WalkAssistant] 'getSteps' not found on PanelDetails.");
+                    continue;
+                }
+                getPanelSteps.setAccessible(true);
+                Object stepsObj = getPanelSteps.invoke(panel);
+                if (!(stepsObj instanceof List))
+                {
+                    continue;
+                }
+
+                List<?> steps = (List<?>) stepsObj;
+                for (int si = 0; si < steps.size(); si++)
+                {
+                    Object step = steps.get(si);
+                    if (step == null)
+                    {
+                        continue;
+                    }
+                    log("[WalkAssistant] Checking PanelDetails[" + pi + "].step[" + si + "] type: "
+                        + step.getClass().getName());
+
+                    WorldPoint wp = resolveWorldPointFromStep(step);
+                    if (wp != null)
+                    {
+                        log("[WalkAssistant] Found start location in PanelDetails[" + pi
+                            + "].step[" + si + "]: " + wp);
+                        return wp;
+                    }
+                }
+            }
+
+            logWarn("[WalkAssistant] No step with a resolvable location found in any PanelDetails.");
+        }
+        catch (Exception e)
+        {
+            logWarn("[WalkAssistant] PanelDetails fallback failed: " + e.getMessage());
         }
         return null;
     }
